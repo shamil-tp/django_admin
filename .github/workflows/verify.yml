@@ -1,0 +1,145 @@
+name: Verify lab
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # INSTRUCTOR: replace OWNER with your GitHub user/organisation before publishing.
+  # Forks do not inherit repository variables, so this default is what students get.
+  # The upstream repository must be public (or reachable with the default token).
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'OWNER/django-admin-lab' }}
+  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'main' }}
+
+jobs:
+  verify:
+    name: Step ${{ matrix.step }} – ${{ matrix.title }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        step: [1, 2, 3, 4, 5]
+        include:
+          - step: 1
+            title: Admin Setup
+          - step: 2
+            title: Model Registration
+          - step: 3
+            title: Data Management
+          - step: 4
+            title: Relationships
+          - step: 5
+            title: Access Control
+
+    steps:
+      - name: Check out student repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      # ---- Tamper protection: always grade with the instructor's original tests ----
+      - name: Fetch original tests from ${{ env.UPSTREAM_REPO }}
+        if: ${{ !startsWith(env.UPSTREAM_REPO, 'OWNER/') }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: .upstream
+          persist-credentials: false
+
+      - name: Replace tests/ with the original tests
+        if: ${{ !startsWith(env.UPSTREAM_REPO, 'OWNER/') }}
+        run: |
+          rm -rf tests pytest.ini
+          cp -r .upstream/tests tests
+          cp .upstream/pytest.ini pytest.ini
+          # Extra conftest.py files outside tests/ could change how tests behave.
+          find . -name conftest.py -not -path "./tests/*" -not -path "./.upstream/*" -print -delete
+          rm -rf .upstream
+
+      - name: Warn about missing upstream configuration
+        if: ${{ startsWith(env.UPSTREAM_REPO, 'OWNER/') }}
+        run: >
+          echo "::warning::UPSTREAM_REPO is still the placeholder 'OWNER/django-admin-lab'.
+          Using this repository's own tests/ (no tamper protection)."
+      # -----------------------------------------------------------------------------
+
+      - name: Apply migrations
+        run: python manage.py migrate
+
+      - name: Run Step ${{ matrix.step }} tests
+        id: pytest
+        run: pytest tests/test_step${{ matrix.step }}_*.py -v
+
+      - name: Record result
+        if: always()
+        run: |
+          mkdir -p result
+          echo "${{ steps.pytest.outcome }}" > "result/step-${{ matrix.step }}.txt"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-step-${{ matrix.step }}
+          path: result/
+          retention-days: 7
+
+  summary:
+    name: Summary
+    needs: verify
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download step results
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: result-step-*
+          path: results
+          merge-multiple: true
+
+      - name: Write results table
+        run: |
+          titles=("" "Admin Setup" "Model Registration" "Data Management" "Relationships" "Access Control")
+          passed=0
+          {
+            echo "## Django Admin Lab – results"
+            echo
+            echo "| Step | Topic | Result |"
+            echo "|:---:|---|:---:|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for n in 1 2 3 4 5; do
+            outcome=$(cat "results/step-$n.txt" 2>/dev/null || echo "missing")
+            if [ "$outcome" = "success" ]; then
+              icon="✅ Pass"; passed=$((passed + 1))
+            else
+              icon="❌ Fail"
+            fi
+            echo "| $n | ${titles[$n]} | $icon |" >> "$GITHUB_STEP_SUMMARY"
+            echo "Step $n (${titles[$n]}): $outcome"
+          done
+          {
+            echo
+            echo "### Score: $passed / 5"
+            echo
+            if [ "$passed" -lt 5 ]; then
+              echo "Open a failed **Step** job on the left and read the \`Run Step N tests\` log – every failure explains what to fix."
+            else
+              echo "🎉 All steps complete!"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Score: $passed / 5"
